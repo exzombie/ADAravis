@@ -166,9 +166,6 @@ public:
     epicsMessageQueueId msgQId;
     void newBufferCallback(ArvStream *stream);
 
-    /** Used by epicsAtExit */
-    ArvCamera *camera;
-
     /** Used by connection lost callback */
     int connectionValid;
 
@@ -198,6 +195,7 @@ private:
     asynStatus makeCameraObject();
     asynStatus makeStreamObject();
 
+    ArvCamera *camera;
     ArvStream *stream;
     ArvDevice *device;
     ArvGc *genicam;
@@ -208,6 +206,7 @@ private:
     int nConsecutiveBadFrames;
     int nBadFramesPrior;
     epicsThread pollingLoop;
+    bool exiting;
     std::vector<arvFeature*> featureList;
 };
 
@@ -314,8 +313,8 @@ ADAravis::ADAravis(const char *portName, const char *cameraName, int enableCachi
                 0
 #endif
             ),
-       camera(NULL),
        connectionValid(0),
+       camera(NULL),
        stream(NULL),
        device(NULL),
        genicam(NULL),
@@ -326,7 +325,8 @@ ADAravis::ADAravis(const char *portName, const char *cameraName, int enableCachi
        pollingLoop(*this, 
                    "aravisPoll", 
                    stackSize>0 ? stackSize : epicsThreadGetStackSize(epicsThreadStackMedium), 
-                   epicsThreadPriorityHigh)
+                   epicsThreadPriorityHigh),
+       exiting(false)
 {
     const char *functionName = "ADAravis";
     char tempString[256];
@@ -400,10 +400,13 @@ ADAravis::ADAravis(const char *portName, const char *cameraName, int enableCachi
 void ADAravis::shutdownPortDriver() {
     asynPrint(pasynUserSelf, ASYN_TRACE_FLOW, "%s shutting down\n", driverName);
 
+    lock();
     GErrorHelper err;
     arv_camera_stop_acquisition(camera, err.get());
     connectionValid = 0;
-    epicsThreadSleep(0.1);
+    exiting = true;
+    unlock();
+    pollingLoop.exitWait();
 
     ADGenICam::shutdownPortDriver();
 }
@@ -711,11 +714,18 @@ void ADAravis::run() {
         epicsThreadSleep(0.1);
     }
 
-    /* Loop forever */
+    /* Loop until driver shutdown */
     epicsTimeGetCurrent(&lastFeatureGet);
     while (1) {
         /* Wait 5ms for an array to arrive from the queue */
         if (epicsMessageQueueReceiveWithTimeout(this->msgQId, &buffer, sizeof(&buffer), 0.005) == -1) {
+            lock();
+            /* We could use needsShutdown() here, but it requires a recent asyn. */
+            bool e = exiting;
+            unlock();
+            if (e) {
+                break;
+            }
         } else {
             /* Got a buffer, so lock up and process it */
             this->lock();
