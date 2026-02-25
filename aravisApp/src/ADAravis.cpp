@@ -409,6 +409,19 @@ void ADAravis::shutdownPortDriver() {
     pollingLoop.exitWait();
 
     ADGenICam::shutdownPortDriver();
+
+    // This would normally go in the destructor. But on old versions of asyn,
+    // the driver is not deleted after shutdown completes, and the following
+    // steps are needed to disconnect the camera.
+    arv_stream_set_emit_signals(stream, false);
+    g_object_unref(stream);
+    g_object_unref(camera);
+
+    // This makes it easier to find use-after-free.
+    stream = NULL;
+    genicam = NULL;
+    device = NULL;
+    camera = NULL;
 }
 
 ADAravis::~ADAravis() {
@@ -419,9 +432,6 @@ ADAravis::~ADAravis() {
     if (!exiting) {
         shutdownPortDriver();
     }
-
-    g_object_unref(camera);
-    camera = NULL;
 }
 
 asynStatus ADAravis::makeCameraObject() {
