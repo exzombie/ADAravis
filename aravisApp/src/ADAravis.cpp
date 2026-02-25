@@ -147,6 +147,7 @@ public:
     /* Constructor */
     ADAravis(const char *portName, const char *cameraName, int enableCaching,
                 size_t maxMemory, int priority, int stackSize);
+    ~ADAravis();
 
     /* These are the methods that we override from ADDriver */
     virtual asynStatus writeInt32(asynUser *pasynUser, epicsInt32 value);
@@ -155,6 +156,7 @@ public:
                                           std::string const & featureName, GCFeatureType_t featureType);
     virtual asynStatus startCapture();
     virtual asynStatus stopCapture();
+    virtual void shutdownPortDriver();
     void report(FILE *fp, int details);
 
     /* This is the method we override from epicsThreadRunable */
@@ -217,19 +219,13 @@ GenICamFeature *ADAravis::createFeature(GenICamFeatureSet *set,
     return pFeature;
 }
 
-/** Called by epicsAtExit to shutdown camera */
+#ifndef ASYN_DESTRUCTIBLE
+/** On old asyn versions, called by epicsAtExit to shutdown camera */
 static void aravisShutdown(void* arg) {
     ADAravis *pPvt = (ADAravis *) arg;
-    GErrorHelper err;
-    ArvCamera *cam = pPvt->camera;
-    printf("ADAravis: Stopping %s... ", pPvt->portName);
-    arv_camera_stop_acquisition(cam, err.get());
-    pPvt->connectionValid = 0;
-    epicsThreadSleep(0.1);
-    pPvt->camera = NULL;
-    g_object_unref(cam);
-    printf("ADAravis: OK\n");
+    pPvt->shutdownPortDriver();
 }
+#endif
 
 /** Called by aravis when destroying a buffer with an NDArray wrapper */
 static void destroyBuffer(gpointer data){
@@ -311,7 +307,13 @@ static void setIocRunningFlag(initHookState state) {
 ADAravis::ADAravis(const char *portName, const char *cameraName, int enableCaching,
                    size_t maxMemory, int priority, int stackSize)
 
-    : ADGenICam(portName, maxMemory, priority, stackSize),
+    : ADGenICam(portName, maxMemory, priority, stackSize,
+#ifdef ASYN_DESTRUCTIBLE
+                ASYN_DESTRUCTIBLE
+#else
+                0
+#endif
+            ),
        camera(NULL),
        connectionValid(0),
        stream(NULL),
@@ -385,12 +387,38 @@ ADAravis::ADAravis(const char *portName, const char *cameraName, int enableCachi
     this->featureIndex = 0;
     this->connectToCamera();
 
+#ifndef ASYN_DESTRUCTIBLE
     /* Register the shutdown function for epicsAtExit */
     epicsAtExit(aravisShutdown, (void*)this);
+#endif
 
     /* Register the pollingLoop to start after iocInit */
     initHookRegister(setIocRunningFlag);
     this->pollingLoop.start();
+}
+
+void ADAravis::shutdownPortDriver() {
+    asynPrint(pasynUserSelf, ASYN_TRACE_FLOW, "%s shutting down\n", driverName);
+
+    GErrorHelper err;
+    arv_camera_stop_acquisition(camera, err.get());
+    connectionValid = 0;
+    epicsThreadSleep(0.1);
+
+    ADGenICam::shutdownPortDriver();
+}
+
+ADAravis::~ADAravis() {
+    // If the driver subclass is not destructible, or asyn is old, or we are not
+    // in an IOC (e.g. unit tests), we need to call shutdown ourselves.
+    // On newer versions of asyn, we could check with needsShutdown() to see if
+    // shutdown has already been done, be we don't want to rely on that.
+    if (!exiting) {
+        shutdownPortDriver();
+    }
+
+    g_object_unref(camera);
+    camera = NULL;
 }
 
 asynStatus ADAravis::makeCameraObject() {
